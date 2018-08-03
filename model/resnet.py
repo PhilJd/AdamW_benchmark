@@ -381,44 +381,32 @@ class Model(object):
 ################################################################################
 # Functions for running training/eval/validation loops for the model.
 ################################################################################
-def learning_rate_with_decay(
-    batch_size, batch_denom, num_images, boundary_epochs, decay_rates):
-  """Get a learning rate that decays step-wise as training progresses.
+def schedule_with_warm_restarts(batch_size, num_images, t_0,
+                                t_mul=2.0, m_mul=0.0, alpha=0.0):
+  """Get a learning rate decay with warm restarts.
 
   Args:
     batch_size: the number of examples processed in each training batch.
-    batch_denom: this value will be used to scale the base learning rate.
-      `0.1 * batch size` is divided by this number, such that when
-      batch_denom == batch_size, the initial learning rate will be 0.1.
-    num_images: total number of images that will be used for training.
-    boundary_epochs: list of ints representing the epochs at which we
-      decay the learning rate.
-    decay_rates: list of floats representing the decay rates to be used
-      for scaling the learning rate. Should be the same length as
-      boundary_epochs.
-
-  Returns:
-    Returns a function that takes a single argument - the number of batches
-    trained so far (global_step)- and returns the learning rate to be used
-    for training the next batch.
+    num_images: Total number of images in the training data set.
+    t_0: Number of epochs before initial decay
   """
-  initial_learning_rate = 0.1 * batch_size / batch_denom
-  batches_per_epoch = num_images / batch_size
+  first_decay_steps = num_images / batch_size * t_0
 
-  # Multiply the learning rate by 0.1 at 100, 150, and 200 epochs.
-  boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
-  vals = [initial_learning_rate * decay for decay in decay_rates]
-
-  def learning_rate_fn(global_step):
+  def schedule_fn(global_step):
     global_step = tf.cast(global_step, tf.int32)
-    return tf.train.piecewise_constant(global_step, boundaries, vals)
-
-  return learning_rate_fn
+    return tf.train.cosine_decay_restarts(1.0, global_step,
+                                          first_decay_steps=first_decay_steps,
+                                          t_mul=t_mul,
+                                          m_mul=m_mul, alpha=alpha)
+  return schedule_fn
 
 
 def resnet_model_fn(features, labels, mode, model_class,
-                    resnet_size, weight_decay, learning_rate_fn, momentum,
-                    data_format, loss_filter_fn=None):
+                    resnet_size, weight_decay, initial_learning_rate,
+                    schedule_fn, momentum,
+                    data_format, loss_filter_fn=None,
+                    decouple_weight_decay=False,
+                    optimizer_base=tf.train.MomentumOptimizer):
   """Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -446,6 +434,8 @@ def resnet_model_fn(features, labels, mode, model_class,
       True if the var should be included in loss calculation, and False
       otherwise. If None, batch_normalization variables will be excluded
       from the loss.
+    decouple_weight_decay: `bool`, if True, weight decay as in 
+    Loshchilow et al. (https://arxiv.org/abs/1711.05101) is used.
   Returns:
     EstimatorSpec parameterized according to the input params and the
     current mode.
@@ -466,12 +456,12 @@ def resnet_model_fn(features, labels, mode, model_class,
     return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
 
   # Calculate loss, which includes softmax cross entropy and L2 regularization.
-  cross_entropy = tf.losses.softmax_cross_entropy(
+  loss = tf.losses.softmax_cross_entropy(
       logits=logits, onehot_labels=labels)
 
   # Create a tensor named cross_entropy for logging purposes.
-  tf.identity(cross_entropy, name='cross_entropy')
-  tf.summary.scalar('cross_entropy', cross_entropy)
+  tf.identity(loss, name='cross_entropy')
+  tf.summary.scalar('cross_entropy', loss)
 
   # If no loss_filter_fn is passed, assume we want the default behavior,
   # which is that batch_normalization variables are excluded from loss.
@@ -480,22 +470,42 @@ def resnet_model_fn(features, labels, mode, model_class,
       return 'batch_normalization' not in name
 
   # Add weight decay to the loss.
-  loss = cross_entropy + weight_decay * tf.add_n(
-      [tf.nn.l2_loss(v) for v in tf.trainable_variables()
-       if loss_filter_fn(v.name)])
+  if not decouple_weight_decay:
+    loss += weight_decay * tf.add_n(
+        [tf.nn.l2_loss(v) for v in tf.trainable_variables()
+         if loss_filter_fn(v.name)])
 
   if mode == tf.estimator.ModeKeys.TRAIN:
     global_step = tf.train.get_or_create_global_step()
 
-    learning_rate = learning_rate_fn(global_step)
+    schedule_multiplier = schedule_fn(global_step)
+    learning_rate = initial_learning_rate * schedule_multiplier
 
     # Create a tensor named learning_rate for logging purposes
     tf.identity(learning_rate, name='learning_rate')
     tf.summary.scalar('learning_rate', learning_rate)
 
-    optimizer = tf.train.MomentumOptimizer(
-        learning_rate=learning_rate,
-        momentum=momentum)
+    if decouple_weight_decay:
+      weight_decay = weight_decay * schedule_multiplier
+      tf.summary.scalar('weight_decay', weight_decay)
+      tf.summary.scalar('schedule_multiplier', learning_rate)
+      if optimizer_base == tf.contrib.opt.MomentumWOptimizer:
+        optimizer = optimizer_base(
+            learning_rate=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay)
+      else:
+        optimizer = optimizer_base(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay)
+    else:
+      if optimizer_base == tf.train.MomentumOptimizer:
+        optimizer = optimizer_base(
+            learning_rate=learning_rate,
+            momentum=momentum)
+      else:
+        optimizer = optimizer_base(
+            learning_rate=learning_rate)
 
     # Batch norm requires update ops to be added as a dependency to train_op
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
@@ -542,7 +552,7 @@ def resnet_main(flags, model_function, input_function):
     }
 
     logging_hook = tf.train.LoggingTensorHook(
-        tensors=tensors_to_log, every_n_iter=100)
+        tensors=tensors_to_log, every_n_iter=1000)
 
     print('Starting a training cycle.')
 

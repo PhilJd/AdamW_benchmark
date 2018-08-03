@@ -20,10 +20,12 @@ from __future__ import print_function
 
 import os
 import sys
+import argparse
 
 import tensorflow as tf
 
 import resnet
+import weight_decay_helper
 
 _HEIGHT = 32
 _WIDTH = 32
@@ -162,59 +164,63 @@ class Cifar10Model(resnet.Model):
         data_format=data_format)
 
 
-def cifar10_model_fn(features, labels, mode, params):
-  """Model function for CIFAR-10."""
-  features = tf.reshape(features, [-1, _HEIGHT, _WIDTH, _NUM_CHANNELS])
-  initial_learning_rate = resnet.initial_learning_rate(
-      batch_size=params['batch_size'], batch_denom=128)
-  schedule_fn = resnet.schedule_multiplier(
-      batch_size=params['batch_size'],
-      num_images=_NUM_IMAGES['train'], boundary_epochs=[100, 150, 200],
-      decay_rates=[1., 0.1, 0.01, 0.001])
+def model_fn_factory(lr, weight_decay, optimizer_base):
 
-  # We use a weight decay of 0.0002, which performs better
-  # than the 0.0001 that was originally suggested.
-  weight_decay = 1e-4
+  def cifar10_model_fn(features, labels, mode, params):
+    """Model function for CIFAR-10."""
+    features = tf.reshape(features, [-1, _HEIGHT, _WIDTH, _NUM_CHANNELS])
+    schedule_fn = resnet.schedule_with_warm_restarts(
+        batch_size=params['batch_size'],
+        num_images=_NUM_IMAGES['train'],
+        t_0=100,
+        m_mul=0.0)  # no restarts
 
-  # Empirical testing showed that including batch_normalization variables
-  # in the calculation of regularized loss helped validation accuracy
-  # for the CIFAR-10 dataset, perhaps because the regularization prevents
-  # overfitting on the small data set. We therefore include all vars when
-  # regularizing and computing loss during training.
-  def loss_filter_fn(name):
-    return True
-  
-  return resnet.resnet_model_fn(features, labels, mode, Cifar10Model,
-                                resnet_size=params['resnet_size'],
-                                weight_decay=weight_decay,
-                                initial_learning_rate=initial_learning_rate,
-                                schedule_fn=schedule_fn,
-                                momentum=0.9,
-                                data_format=params['data_format'],
-                                loss_filter_fn=None,
-                                decouple_weight_decay=FLAGS.decouple_weight_decay)
-
-
-def main(unused_argv):
-  resnet.resnet_main(FLAGS, cifar10_model_fn, input_fn)
+    # Empirical testing showed that including batch_normalization variables
+    # in the calculation of regularized loss helped validation accuracy
+    # for the CIFAR-10 dataset, perhaps because the regularization prevents
+    # overfitting on the small data set. We therefore include all vars when
+    # regularizing and computing loss during training.
+    def loss_filter_fn(name):
+      return True
+    return resnet.resnet_model_fn(features, labels, mode, Cifar10Model,
+                                  resnet_size=params['resnet_size'],
+                                  weight_decay=weight_decay,
+                                  initial_learning_rate=lr,
+                                  schedule_fn=schedule_fn,
+                                  momentum=0.9,
+                                  data_format=params['data_format'],
+                                  loss_filter_fn=loss_filter_fn,
+                                  decouple_weight_decay=FLAGS.decouple_weight_decay,
+                                  optimizer_base=optimizer_base)
+  return cifar10_model_fn
 
 
 if __name__ == '__main__':
-  tf.logging.set_verbosity(tf.logging.INFO)
+  #tf.logging.set_verbosity(tf.logging.INFO)
+  FLAGS = argparse.Namespace()
+  FLAGS.resnet_size = 32
+  FLAGS.train_epochs = 100
+  FLAGS.epochs_per_eval = 10
+  FLAGS.batch_size = 128
+  FLAGS.data_dir = '/home/jundp/Data/cifar10'
+  FLAGS.base_model_dir = '/home/jundp/Data/adamw/param_grid_warm_restarts/cifar10_'
+  FLAGS.num_parallel_calls = 5
+  FLAGS.data_format = 'channels_first'
+  for opt_name, optimizer, decoupled in (('momentumw', tf.contrib.opt.MomentumWOptimizer, True),
+                                         ('momentum', tf.train.MomentumOptimizer, False),
+                                         ('adam', tf.train.AdamOptimizer, False),
+                                         ('adamw', tf.contrib.opt.AdamWOptimizer, True)):
+    FLAGS.decouple_weight_decay = decoupled
+    for lr in [0.1, 0.01, 0.001, 1.0, 10.0]:
+      for weight_decay in [0.00001, 0.0001, 0.001]:
+        FLAGS.model_dir = (FLAGS.base_model_dir + opt_name + "lr_" +
+                           str(lr) + "_weight_decay_" + str(weight_decay))
+        if os.path.isdir(FLAGS.model_dir):
+          continue  # don't train already trained models
+        print(FLAGS.model_dir)
+        model_fn = model_fn_factory(lr, weight_decay, optimizer)
+        try:
+            resnet.resnet_main(FLAGS, model_fn, input_fn)
+        except tf.train.NanLossDuringTrainingError:
+            print("Nan error.")
 
-  parser = resnet.ResnetArgParser()
-  # Set defaults that are reasonable for this model.
-  parser.set_defaults(data_dir='/tmp/cifar10_data',
-                      model_dir='/tmp/cifar10_model',
-                      resnet_size=32,
-                      train_epochs=250,
-                      epochs_per_eval=10,
-                      batch_size=128)
-
-  parser.add_argument(
-      '--decouple_weight_decay', type=bool, default=False,
-      help='If true, weight decay as in `Fixing Weight decay regularization`'
-           'by Loshchilov et al. is used.')
-
-  FLAGS, unparsed = parser.parse_known_args()
-  tf.app.run(argv=[sys.argv[0]] + unparsed)
